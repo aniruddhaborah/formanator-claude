@@ -9,8 +9,14 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 
 import { actionRunner } from '../utils.js';
-import { getAccessToken, getIntegrationAuth, storeIntegrationAuth } from '../config.js';
-import { getBenefitsWithCategories, getClaimsList, createClaim } from '../forma.js';
+import { getAccessToken, getIntegrationAuth, storeIntegrationAuth, storeConfig } from '../config.js';
+import {
+  getBenefitsWithCategories,
+  getClaimsList,
+  createClaim,
+  requestMagicLink,
+  exchangeIdAndTkForAccessToken,
+} from '../forma.js';
 import { claimParamsToCreateClaimOptions } from '../claims.js';
 import {
   convertToImageIfNeeded,
@@ -46,6 +52,37 @@ const createMcpServer = () => {
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
       tools: [
+        {
+          name: 'requestMagicLink',
+          description:
+            'Request a Forma magic link login email. Call this first, then ask the user to paste the link from their email, then call loginWithMagicLink.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              email: {
+                type: 'string',
+                description: 'The email address associated with the Forma account',
+              },
+            },
+            required: ['email'],
+          },
+        },
+        {
+          name: 'loginWithMagicLink',
+          description:
+            'Log in to Forma using a magic link URL from email. The user should paste the full URL they received after calling requestMagicLink.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              magicLink: {
+                type: 'string',
+                description:
+                  'The full magic link URL from the Forma login email (starts with https://joinforma.page.link/...)',
+              },
+            },
+            required: ['magicLink'],
+          },
+        },
         {
           name: 'listBenefitsWithCategories',
           description:
@@ -229,12 +266,61 @@ const createMcpServer = () => {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
-    // Fetch access token for each tool invocation
+    // Login tools don't require an access token
+    if (name === 'requestMagicLink') {
+      const { email } = args as { email: string };
+      try {
+        await requestMagicLink(email);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Magic link email sent to ${email}. Ask the user to check their email and paste the magic link URL, then call loginWithMagicLink with it.`,
+            },
+          ],
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        throw new McpError(ErrorCode.InternalError, `Failed to request magic link: ${errorMessage}`);
+      }
+    }
+
+    if (name === 'loginWithMagicLink') {
+      const { magicLink } = args as { magicLink: string };
+      try {
+        const parsedUrl = new URL(magicLink);
+        const linkParam = parsedUrl.searchParams.get('link');
+        if (!linkParam) {
+          throw new Error('Magic link URL must contain a `link` query parameter.');
+        }
+        const realMagicLink = new URL(decodeURIComponent(linkParam));
+        const id = realMagicLink.searchParams.get('id');
+        const tk = realMagicLink.searchParams.get('tk');
+        if (!id || !tk) {
+          throw new Error('Magic link must contain `id` and `tk` parameters.');
+        }
+        const accessToken = await exchangeIdAndTkForAccessToken(id, tk);
+        storeConfig({ accessToken });
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'Successfully logged in to Forma!',
+            },
+          ],
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        throw new McpError(ErrorCode.InternalError, `Login failed: ${errorMessage}`);
+      }
+    }
+
+    // All other tools require an access token
     const accessToken = getAccessToken();
     if (!accessToken) {
       throw new McpError(
         ErrorCode.InternalError,
-        "You aren't logged in to Forma. Please run `npx formanator login` first.",
+        "You aren't logged in to Forma. Use the requestMagicLink tool to start the login flow.",
       );
     }
 
